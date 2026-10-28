@@ -4,6 +4,7 @@ Velvet3PrefsManager *prefsManager;
 
 static NSString *const kVelvetUpdateNotification = @"com.belubruh123.velvet3/updateStyle";
 static NSString *const kVelvetFocusIdentifier    = @"com.belubruh123.velvetFocus";
+static const void *kVelvetResolvedIconKey        = &kVelvetResolvedIconKey;
 
 #pragma mark - Private-state accessors
 //
@@ -34,14 +35,73 @@ static NSString *VelvetIdentifierFor(id controller) {
 }
 
 /// The view holding the app icon. iOS 15/16 exposed it as `badgedIconView.iconView`;
-/// on iOS 18 the icon is a plain UIImageView inside NCBadgedIconView.
+/// on iOS 18 the icon is usually a UIImageView inside NCBadgedIconView. Some
+/// communication notifications wrap it in an NCAvatarView first.
+static UIImage *VelvetImageFromImageView(UIImageView *imageView) {
+    if (imageView.image) return imageView.image;
+
+    // Some Notification Center image views are populated directly through
+    // CALayer.contents, leaving UIImageView.image nil even while the icon is visible.
+    id contents = imageView.layer.contents;
+    if (contents && CFGetTypeID((__bridge CFTypeRef)contents) == CGImageGetTypeID()) {
+        return [UIImage imageWithCGImage:(__bridge CGImageRef)contents
+                                  scale:UIScreen.mainScreen.scale
+                            orientation:UIImageOrientationUp];
+    }
+    return nil;
+}
+
+static UIImageView *VelvetPopulatedImageViewIn(UIView *root) {
+    if ([root isKindOfClass:UIImageView.class] &&
+        VelvetImageFromImageView((UIImageView *)root)) {
+        return (UIImageView *)root;
+    }
+    for (UIView *subview in root.subviews) {
+        UIImageView *match = VelvetPopulatedImageViewIn(subview);
+        if (match) return match;
+    }
+    return nil;
+}
+
 static UIView *VelvetAppIconViewIn(id contentView) {
     UIView *badgedIconView = VLTIvar(contentView, @"badgedIconView");
     if (!badgedIconView) return nil;
 
-    id iconView = VLTSafePerform(badgedIconView, @selector(iconView));
-    if ([iconView isKindOfClass:UIView.class]) return (UIView *)iconView;
+    // iOS 18 communication notifications deliberately expose two different images:
+    // `iconView` is the large NCAvatarView (often a gray contact silhouette), while
+    // `subordinateIconView` is the small application badge. Velvet's "icon" colour is
+    // app-derived, so prefer the explicit app badge rather than whichever descendant
+    // UIImageView happens to be populated first.
+    id subordinateIconView = VLTSafePerform(badgedIconView,
+                                             NSSelectorFromString(@"subordinateIconView"));
+    if ([subordinateIconView isKindOfClass:UIImageView.class] &&
+        VelvetImageFromImageView((UIImageView *)subordinateIconView)) {
+        return (UIView *)subordinateIconView;
+    }
 
+    id iconView = VLTSafePerform(badgedIconView, @selector(iconView));
+    if ([iconView isKindOfClass:UIImageView.class] &&
+        VelvetImageFromImageView((UIImageView *)iconView)) {
+        return (UIView *)iconView;
+    }
+
+    // Messages and other communication notifications use
+    // NCBadgedIconView -> NCAvatarView -> UIImageView on iOS 18.7. Returning
+    // the wrapper makes VelvetAppIconIn reject it and leaves every "icon"
+    // colour transparent. Resolve the image view inside wrappers instead.
+    if ([iconView isKindOfClass:UIView.class]) {
+        UIView *nestedImageView = VelvetPopulatedImageViewIn(iconView);
+        if (nestedImageView) return nestedImageView;
+    }
+
+    // The communication avatar can be empty during the first layout pass while
+    // NCBadgedIconView's separate app-badge image is already populated. Search all
+    // descendants rather than stopping at the first UIImageView.
+    UIView *populated = VelvetPopulatedImageViewIn(badgedIconView);
+    if (populated) return populated;
+
+    // Preserve the old return behaviour for corner-radius handling when no image has
+    // arrived yet. VelvetAppIconIn will retain the last usable image independently.
     return VLTDescendantOfClass(badgedIconView, @"UIImageView");
 }
 
@@ -57,13 +117,24 @@ static UIImage *VelvetAppIconIn(id contentView) {
     if (![icon isKindOfClass:UIImage.class]) {
         icon = VLTSafePerform(contentView, @selector(subordinateIcon));
     }
-    if ([icon isKindOfClass:UIImage.class]) return (UIImage *)icon;
+    if ([icon isKindOfClass:UIImage.class]) {
+        objc_setAssociatedObject(contentView, kVelvetResolvedIconKey, icon,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return (UIImage *)icon;
+    }
 
     UIView *iconView = VelvetAppIconViewIn(contentView);
     if ([iconView isKindOfClass:UIImageView.class]) {
-        return ((UIImageView *)iconView).image;
+        UIImage *resolved = VelvetImageFromImageView((UIImageView *)iconView);
+        if (resolved) {
+            // Swipe/reveal transitions temporarily clear the notification image views.
+            // Keep the last valid icon so a later layout pass cannot repaint gray.
+            objc_setAssociatedObject(contentView, kVelvetResolvedIconKey, resolved,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return resolved;
+        }
     }
-    return nil;
+    return objc_getAssociatedObject(contentView, kVelvetResolvedIconKey);
 }
 
 /// iOS 15 kept this on the controller's content view; iOS 16 moved it onto the short

@@ -1,13 +1,11 @@
 name: Build Velvet 3
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch:
 
 jobs:
   build:
     name: Build rootless package (macOS)
-    runs-on: macos-latest
+    runs-on: macos-15
     env:
       THEOS: ${{ github.workspace }}/theos
       THEOS_PACKAGE_SCHEME: rootless
